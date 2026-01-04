@@ -319,6 +319,7 @@ impl LspServerState {
             )?
             .on::<lsp_types::request::Rename>(handlers::text_document::handle_rename)?
             .on::<lsp_types::request::References>(handlers::text_document::handle_references)?
+            .on::<lsp_types::request::GotoDefinition>(handlers::text_document::goto_definition)?
             .on::<lsp_types::request::SemanticTokensFullRequest>(
                 handlers::text_document::semantic_tokens_full,
             )?

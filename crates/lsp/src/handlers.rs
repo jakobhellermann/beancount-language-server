@@ -1,6 +1,7 @@
 pub mod text_document {
     use crate::providers::completion;
     use crate::providers::formatting;
+    use crate::providers::goto_definition;
     use crate::providers::references;
     use crate::providers::semantic_tokens;
     use crate::providers::text_document;
@@ -202,6 +203,37 @@ pub mod text_document {
             }
             Ok(None) => {
                 tracing::debug!("No references found");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::error!("References lookup failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn goto_definition(
+        snapshot: LspServerStateSnapshot,
+        params: lsp_types::GotoDefinitionParams,
+    ) -> Result<Option<lsp_types::GotoDefinitionResponse>> {
+        tracing::info!(
+            "Go to definition requested for: {} at {}:{}",
+            params
+                .text_document_position_params
+                .text_document
+                .uri
+                .as_str(),
+            params.text_document_position_params.position.line,
+            params.text_document_position_params.position.character
+        );
+
+        match goto_definition::definition(snapshot, params) {
+            Ok(Some(locations)) => {
+                tracing::info!("Found {} definitions", locations.len());
+                Ok(Some(lsp_types::GotoDefinitionResponse::Link(locations)))
+            }
+            Ok(None) => {
+                tracing::debug!("No definition found");
                 Ok(None)
             }
             Err(e) => {

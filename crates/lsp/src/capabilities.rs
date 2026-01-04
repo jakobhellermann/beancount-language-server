@@ -42,6 +42,7 @@ pub(crate) fn server_capabilities() -> ServerCapabilities {
                 work_done_progress: None,
             },
         })),
+        definition_provider: Some(OneOf::Left(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: semantic_tokens::legend(),

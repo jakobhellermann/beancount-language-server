@@ -2,6 +2,8 @@ pub mod completion;
 /// Provider definitions for LSP `textDocument/publishDiagnostics`.
 pub mod diagnostics;
 pub mod formatting;
+/// Provider definitions for LSP `textDocument/definition`.
+pub mod goto_definition;
 /// Provider definitions for LSP `textDocument/references` and `textDocument/rename`.
 pub mod references;
 /// Provider definitions for LSP semantic tokens (syntax highlighting).
