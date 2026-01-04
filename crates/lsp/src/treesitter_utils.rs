@@ -127,3 +127,10 @@ pub fn point_to_position(point: tree_sitter::Point) -> lsp_types::Position {
         character: point.column as u32,
     }
 }
+
+pub fn range_to_lsp(point: tree_sitter::Range) -> lsp_types::Range {
+    lsp_types::Range {
+        start: point_to_position(point.start_point),
+        end: point_to_position(point.end_point),
+    }
+}

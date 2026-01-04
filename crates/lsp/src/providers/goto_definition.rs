@@ -52,15 +52,10 @@ pub(crate) fn definition(
 
     match node.grammar_name() {
         "account" => {
-            let origin = node.range();
-
             let locs = find_account_opens(&forest, &open_docs, node_text);
             Ok(Some(
                 locs.map(|loc| lsp_types::LocationLink {
-                    origin_selection_range: Some(lsp_types::Range {
-                        start: treesitter_utils::point_to_position(origin.start_point),
-                        end: treesitter_utils::point_to_position(origin.end_point),
-                    }),
+                    origin_selection_range: Some(treesitter_utils::range_to_lsp(node.range())),
                     target_uri: loc.uri,
                     target_range: loc.range,
                     target_selection_range: loc.range,
@@ -119,13 +114,9 @@ fn find_account_opens(
             }
         })
         .map(|(url, node): (PathBuf, tree_sitter::Node)| {
-            let range = node.range();
             Location::new(
                 utils::path_to_uri(&url),
-                lsp_types::Range {
-                    start: treesitter_utils::point_to_position(range.start_point),
-                    end: treesitter_utils::point_to_position(range.end_point),
-                },
+                treesitter_utils::range_to_lsp(node.range()),
             )
         })
 }
