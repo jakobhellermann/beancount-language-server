@@ -23,21 +23,14 @@ pub(crate) fn references(
         .uri
         .to_file_path()
         .unwrap();
-    let line = params.text_document_position.position.line;
-    let char = params.text_document_position.position.character;
     let forest = snapshot.forest;
+
+    let end = treesitter_utils::position_to_point(params.text_document_position.position);
     let start = tree_sitter::Point {
-        row: line as usize,
-        column: if char == 0 {
-            char as usize
-        } else {
-            char as usize - 1
-        },
+        row: end.row,
+        column: end.column.saturating_sub(1),
     };
-    let end = tree_sitter::Point {
-        row: line as usize,
-        column: char as usize,
-    };
+
     let Some(node) = forest
         .get(&uri)
         .expect("to have tree found")
@@ -64,25 +57,18 @@ pub(crate) fn rename(
         .uri
         .to_file_path()
         .unwrap();
-    let line = &params.text_document_position.position.line;
-    let char = &params.text_document_position.position.character;
     let forest = snapshot.forest;
     let _tree = forest.get(uri).unwrap();
     let open_docs = snapshot.open_docs;
     let doc = open_docs.get(uri).unwrap();
     let content = doc.clone().content;
+
+    let end = treesitter_utils::position_to_point(params.text_document_position.position);
     let start = tree_sitter::Point {
-        row: *line as usize,
-        column: if *char == 0 {
-            *char as usize
-        } else {
-            *char as usize - 1
-        },
+        row: end.row,
+        column: end.column.saturating_sub(1),
     };
-    let end = tree_sitter::Point {
-        row: *line as usize,
-        column: *char as usize,
-    };
+
     let Some(node) = forest
         .get(uri)
         .expect("to have tree found")

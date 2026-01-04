@@ -22,21 +22,14 @@ pub(crate) fn definition(
         .uri
         .to_file_path()
         .unwrap();
-    let line = params.text_document_position_params.position.line;
-    let char = params.text_document_position_params.position.character;
     let forest = snapshot.forest;
+
+    let end = treesitter_utils::position_to_point(params.text_document_position_params.position);
     let start = tree_sitter::Point {
-        row: line as usize,
-        column: if char == 0 {
-            char as usize
-        } else {
-            char as usize - 1
-        },
+        row: end.row,
+        column: end.column.saturating_sub(1),
     };
-    let end = tree_sitter::Point {
-        row: line as usize,
-        column: char as usize,
-    };
+
     let Some(node) = forest
         .get(&uri)
         .expect("to have tree found")
