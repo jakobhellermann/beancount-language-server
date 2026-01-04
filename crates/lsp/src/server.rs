@@ -347,6 +347,9 @@ impl LspServerState {
             .on::<lsp_types::notification::DidChangeTextDocument>(
                 handlers::text_document::did_change,
             )?
+            .on::<lsp_types::notification::DidChangeConfiguration>(
+                handlers::configuration::did_change,
+            )?
             .finish();
         Ok(())
     }

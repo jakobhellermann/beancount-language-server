@@ -255,3 +255,26 @@ pub mod text_document {
         semantic_tokens::semantic_tokens_full(snapshot, params)
     }
 }
+
+pub mod configuration {
+    use crate::server::LspServerState;
+    use anyhow::Result;
+
+    /// handler for `workspace/didChangeConfiguration`.
+    pub(crate) fn did_change(
+        state: &mut LspServerState,
+        params: lsp_types::DidChangeConfigurationParams,
+    ) -> Result<()> {
+        tracing::info!("Configuration changed: {}", params.settings);
+
+        match state.config.update(params.settings) {
+            Ok(()) => tracing::debug!("Configuration updated successfully"),
+            Err(e) => {
+                tracing::warn!("Failed to update configuration: {}", e);
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+}
