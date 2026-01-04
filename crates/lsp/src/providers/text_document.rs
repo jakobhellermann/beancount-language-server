@@ -8,6 +8,7 @@ use crate::server::ProgressMsg;
 use crate::server::Task;
 use crate::to_json;
 use crate::treesitter_utils::lsp_textdocchange_to_ts_inputedit;
+use crate::utils;
 use crate::utils::ToFilePath;
 use anyhow::Result;
 use crossbeam_channel::Sender;
@@ -16,7 +17,6 @@ use lsp_types::notification::Notification;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::debug;
 use tree_sitter_beancount::tree_sitter;
@@ -331,12 +331,7 @@ fn handle_diagnostics(
             .send(Task::Notify(lsp_server::Notification {
                 method: lsp_types::notification::PublishDiagnostics::METHOD.to_owned(),
                 params: to_json(lsp_types::PublishDiagnosticsParams {
-                    uri: {
-                        let url = url::Url::from_file_path(file)
-                            .expect("Failed to convert file path to URI");
-                        lsp_types::Uri::from_str(url.as_str())
-                            .expect("Failed to parse URL as LSP URI")
-                    },
+                    uri: utils::path_to_uri(file),
                     diagnostics,
                     version: None,
                 })

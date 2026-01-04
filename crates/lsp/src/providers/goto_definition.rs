@@ -1,12 +1,11 @@
 use crate::document::Document;
 use crate::server::LspServerStateSnapshot;
 use crate::treesitter_utils::text_for_tree_sitter_node;
-use crate::utils::ToFilePath;
+use crate::utils::{self, ToFilePath};
 use anyhow::Result;
 use lsp_types::Location;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::debug;
 use tree_sitter::StreamingIterator;
@@ -128,24 +127,7 @@ fn find_account_opens(
         .map(|(url, node): (PathBuf, tree_sitter::Node)| {
             let range = node.range();
             Location::new(
-                {
-                    // Handle cross-platform file URI creation
-                    let file_path_str = url.to_str().unwrap();
-                    let uri_str = if cfg!(windows)
-                        && file_path_str.len() > 1
-                        && file_path_str.chars().nth(1) == Some(':')
-                    {
-                        // Windows absolute path like "C:\path"
-                        format!("file:///{}", file_path_str.replace('\\', "/"))
-                    } else if cfg!(windows) && file_path_str.starts_with('/') {
-                        // Unix-style path on Windows, convert to Windows style
-                        format!("file:///C:{}", file_path_str.replace('\\', "/"))
-                    } else {
-                        // Unix path or other platforms
-                        format!("file://{file_path_str}")
-                    };
-                    lsp_types::Uri::from_str(&uri_str).unwrap()
-                },
+                utils::path_to_uri(&url),
                 lsp_types::Range {
                     start: lsp_types::Position {
                         line: range.start_point.row as u32,
