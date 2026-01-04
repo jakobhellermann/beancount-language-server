@@ -1,6 +1,6 @@
 use crate::document::Document;
 use crate::server::LspServerStateSnapshot;
-use crate::treesitter_utils::text_for_tree_sitter_node;
+use crate::treesitter_utils::{self, text_for_tree_sitter_node};
 use crate::utils::{self, ToFilePath};
 use anyhow::Result;
 use lsp_types::Location;
@@ -58,14 +58,8 @@ pub(crate) fn definition(
             Ok(Some(
                 locs.map(|loc| lsp_types::LocationLink {
                     origin_selection_range: Some(lsp_types::Range {
-                        start: lsp_types::Position {
-                            line: origin.start_point.row as u32,
-                            character: origin.start_point.column as u32,
-                        },
-                        end: lsp_types::Position {
-                            line: origin.end_point.row as u32,
-                            character: origin.end_point.column as u32,
-                        },
+                        start: treesitter_utils::point_to_position(origin.start_point),
+                        end: treesitter_utils::point_to_position(origin.end_point),
                     }),
                     target_uri: loc.uri,
                     target_range: loc.range,
@@ -129,14 +123,8 @@ fn find_account_opens(
             Location::new(
                 utils::path_to_uri(&url),
                 lsp_types::Range {
-                    start: lsp_types::Position {
-                        line: range.start_point.row as u32,
-                        character: range.start_point.column as u32,
-                    },
-                    end: lsp_types::Position {
-                        line: range.end_point.row as u32,
-                        character: range.end_point.column as u32,
-                    },
+                    start: treesitter_utils::point_to_position(range.start_point),
+                    end: treesitter_utils::point_to_position(range.end_point),
                 },
             )
         })

@@ -120,3 +120,10 @@ pub fn text_for_tree_sitter_node(
     let slice = source.slice(start..end);
     slice.into()
 }
+
+pub fn point_to_position(point: tree_sitter::Point) -> lsp_types::Position {
+    lsp_types::Position {
+        line: point.row as u32,
+        character: point.column as u32,
+    }
+}
