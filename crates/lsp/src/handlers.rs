@@ -277,4 +277,126 @@ pub mod configuration {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::config::Config;
+        use std::path::PathBuf;
+
+        fn create_test_state() -> LspServerState {
+            let config = Config::new(PathBuf::new());
+            let (sender, _receiver) = crossbeam_channel::unbounded();
+            LspServerState::new(sender, config)
+        }
+
+        #[test]
+        fn test_did_change_updates_journal_file() {
+            let mut state = create_test_state();
+            let params = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "journal_file": "/path/to/journal.beancount"
+                }),
+            };
+
+            did_change(&mut state, params).unwrap();
+
+            assert_eq!(
+                state.config.journal_root,
+                Some(PathBuf::from("/path/to/journal.beancount"))
+            );
+        }
+
+        #[test]
+        fn test_did_change_updates_formatting_options() {
+            let mut state = create_test_state();
+            let params = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "formatting": {
+                        "prefix_width": 10,
+                        "num_width": 12,
+                        "currency_column": 80,
+                        "account_amount_spacing": 4,
+                        "number_currency_spacing": 2
+                    }
+                }),
+            };
+
+            did_change(&mut state, params).unwrap();
+
+            assert_eq!(state.config.formatting.prefix_width, Some(10));
+            assert_eq!(state.config.formatting.num_width, Some(12));
+            assert_eq!(state.config.formatting.currency_column, Some(80));
+            assert_eq!(state.config.formatting.account_amount_spacing, 4);
+            assert_eq!(state.config.formatting.number_currency_spacing, 2);
+        }
+
+        #[test]
+        fn test_did_change_updates_bean_check_method() {
+            let mut state = create_test_state();
+            let params = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "bean_check": {
+                        "method": "python-embedded"
+                    }
+                }),
+            };
+
+            did_change(&mut state, params).unwrap();
+
+            assert_eq!(
+                state.config.bean_check.method,
+                crate::checkers::BeancountCheckMethod::PythonEmbedded
+            );
+        }
+
+        #[test]
+        fn test_did_change_handles_empty_settings() {
+            let mut state = create_test_state();
+            let original_journal = state.config.journal_root.clone();
+
+            let params = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({}),
+            };
+
+            did_change(&mut state, params).unwrap();
+
+            // Config should remain unchanged
+            assert_eq!(state.config.journal_root, original_journal);
+        }
+
+        #[test]
+        fn test_did_change_partial_update() {
+            let mut state = create_test_state();
+
+            // First update
+            let params1 = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "journal_file": "/path/to/journal.beancount",
+                    "formatting": {
+                        "prefix_width": 10
+                    }
+                }),
+            };
+            did_change(&mut state, params1).unwrap();
+
+            // Second update that only changes formatting
+            let params2 = lsp_types::DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "formatting": {
+                        "num_width": 15
+                    }
+                }),
+            };
+            did_change(&mut state, params2).unwrap();
+
+            // Both updates should be preserved
+            assert_eq!(
+                state.config.journal_root,
+                Some(PathBuf::from("/path/to/journal.beancount"))
+            );
+            assert_eq!(state.config.formatting.prefix_width, Some(10));
+            assert_eq!(state.config.formatting.num_width, Some(15));
+        }
+    }
 }
