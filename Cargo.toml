@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = ["crates/beancount-formatter",
     "crates/lsp",
 ]
 resolver = "2"
