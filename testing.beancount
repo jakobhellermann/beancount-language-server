@@ -1,0 +1,35 @@
+option "documents" "data"
+
+2020-01-01 open Assets:ZeroSum:Transfers EUR
+
+2020-01-01 custom "fava-extension" "fava_dashboards"
+2020-01-01 custom "fava-option" "languade" "de"
+
+2022-04-30 balance Assets:BIBEssen:Checking  26823.31 EUR
+2022-12-01 balance Assets:BIBEssen:Checking  31705.05 EUR
+2024-08-01 balance Assets:BIBEssen:Checking  38210.57 EUR
+2022-03-01 balance Assets:BIBEssen:Checking  24872.78 EUR
+2025-05-01 balance Assets:BIBEssen:Checking  15099.26 EUR
+
+; header
+
+2025-12-01 * "Person" "Dauerauftragsbelast
+Gitarrenunterricht /*DA-2* IBAN: DE63 760100850700431852 BIC: PBNKDEFFXXX"
+  Assets:BIBEssen:Checking                         -99.00 EUR
+  Expenses:Entertainment:Guitar                     99.00 EUR
+
+2025-12-01 * "People" "Dauerauftragsbelast
+Miete Jakob /*DA-3* IBAN: DE76430609677023492903 BIC: GENODEM1GLS"
+  Assets:BIBEssen:Checking                        -400.00 EUR
+  Expenses:Housing:Rent                            400.00 EUR
+
+2025-12-05 * "ALDI GmbH + Co. KG HERTEN" "Kartenzahlung girocard
+ALDI SAGT DANKE 01 086/Essen-Huttrop/DE 04.12.2025 um 17:12:15 Uhr 54412769/068550/ECTL/ 36060295/0073920019/1/1227 REF 746710/260045"
+  Assets:BIBEssen:Checking                          -1.78 EUR
+  Expenses:Food:Groceries                            1.78 EUR
+
+2025-12-03 * "ALDI GmbH + Co. KG HERTEN" "Kartenzahlung girocard
+ALDI SAGT DANKE 01 086/Essen-Huttrop/DE 02.12.2025 um 19:26:52 Uhr 54412769/067788/ECTL/ 36060295/0073920019/1/1227 REF 685995/260045"
+  Assets:BIBEssen:Checking                         -21.27 EUR
+  Expenses:Food:Groceries                           21.27 EUR
+
