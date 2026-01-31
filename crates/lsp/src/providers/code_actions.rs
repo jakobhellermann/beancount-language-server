@@ -1,0 +1,970 @@
+use crate::server::LspServerStateSnapshot;
+use crate::treesitter_utils::{
+    lsp_position_to_tree_sitter_point, text_for_tree_sitter_node, tree_sitter_node_to_lsp_range,
+};
+use crate::utils::ToFilePath;
+use anyhow::Result;
+use std::collections::HashMap;
+use tree_sitter_beancount::tree_sitter;
+
+/// Main handler for code actions
+pub(crate) fn code_actions(
+    snapshot: LspServerStateSnapshot,
+    params: lsp_types::CodeActionParams,
+) -> Result<Option<Vec<lsp_types::CodeActionOrCommand>>> {
+    let path = match params.text_document.uri.to_file_path() {
+        Ok(path) => path,
+        Err(_) => {
+            tracing::debug!("Failed to convert URI to file path");
+            return Ok(None);
+        }
+    };
+
+    // Get the tree and content for this file
+    let tree = match snapshot.forest.get(&path) {
+        Some(tree) => tree,
+        None => {
+            tracing::debug!("No parse tree found for file");
+            return Ok(None);
+        }
+    };
+
+    let content = match snapshot.open_docs.get(&path) {
+        Some(doc) => &doc.content,
+        None => {
+            tracing::debug!("Document not open");
+            return Ok(None);
+        }
+    };
+
+    // Collect all available code actions
+    let mut actions = Vec::new();
+
+    // Check for narration at cursor
+    if let Some(narration_info) = find_narration_at_cursor(tree, content, params.range.start) {
+        if let Some(action) =
+            build_move_to_metadata_action(content, &narration_info, &params.text_document.uri)
+        {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(action));
+        }
+    }
+
+    // Check for payee at cursor
+    if let Some(payee_info) = find_payee_at_cursor(tree, content, params.range.start) {
+        if let Some(action) =
+            build_move_payee_to_metadata_action(content, &payee_info, &params.text_document.uri)
+        {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(action));
+        }
+    }
+
+    if actions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(actions))
+    }
+}
+
+#[derive(Debug)]
+struct NarrationInfo {
+    /// The tree-sitter node for the narration
+    narration_node: tree_sitter::Node<'static>,
+    /// The parent transaction node
+    transaction_node: tree_sitter::Node<'static>,
+    /// The narration text (without quotes)
+    narration_text: String,
+}
+
+#[derive(Debug)]
+struct PayeeInfo {
+    /// The tree-sitter node for the payee
+    payee_node: tree_sitter::Node<'static>,
+    /// The parent transaction node
+    transaction_node: tree_sitter::Node<'static>,
+    /// The payee text (without quotes)
+    payee_text: String,
+}
+
+/// Find narration node at the given cursor position
+fn find_narration_at_cursor(
+    tree: &tree_sitter::Tree,
+    content: &ropey::Rope,
+    cursor_position: lsp_types::Position,
+) -> Option<NarrationInfo> {
+    // Convert LSP position (UTF-16 code units) to tree-sitter Point (byte offset)
+    let ts_point = lsp_position_to_tree_sitter_point(content, cursor_position).ok()?;
+
+    // Find the node at the cursor position
+    let root = tree.root_node();
+    let node = root.named_descendant_for_point_range(ts_point, ts_point)?;
+
+    // Check if we're on a narration node
+    let (narration_node, transaction_node) = if node.kind() == "narration" {
+        // Direct hit on narration
+        let transaction = find_parent_transaction(&node)?;
+        (node, transaction)
+    } else if node.kind() == "string" {
+        // We might be on the string content inside narration
+        let parent = node.parent()?;
+        if parent.kind() == "narration" {
+            let transaction = find_parent_transaction(&parent)?;
+            (parent, transaction)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // Extract narration text
+    let narration_text_raw = text_for_tree_sitter_node(content, &narration_node);
+    let narration_text = narration_text_raw.trim().trim_matches('"').to_string();
+
+    // Check if source_desc already exists
+    if has_source_desc_metadata(&transaction_node, content) {
+        tracing::debug!("Transaction already has source_desc metadata");
+        return None;
+    }
+
+    // Make the node 'static by leaking the tree
+    // This is safe because we only use it within this function scope
+    let narration_node_static = unsafe { std::mem::transmute(narration_node) };
+    let transaction_node_static = unsafe { std::mem::transmute(transaction_node) };
+
+    Some(NarrationInfo {
+        narration_node: narration_node_static,
+        transaction_node: transaction_node_static,
+        narration_text,
+    })
+}
+
+/// Find payee node at the given cursor position
+fn find_payee_at_cursor(
+    tree: &tree_sitter::Tree,
+    content: &ropey::Rope,
+    cursor_position: lsp_types::Position,
+) -> Option<PayeeInfo> {
+    // Convert LSP position (UTF-16 code units) to tree-sitter Point (byte offset)
+    let ts_point = lsp_position_to_tree_sitter_point(content, cursor_position).ok()?;
+
+    // Find the node at the cursor position
+    let root = tree.root_node();
+    let node = root.named_descendant_for_point_range(ts_point, ts_point)?;
+
+    // Check if we're on a payee node
+    let (payee_node, transaction_node) = if node.kind() == "payee" {
+        // Direct hit on payee
+        let transaction = find_parent_transaction(&node)?;
+        (node, transaction)
+    } else if node.kind() == "string" {
+        // We might be on the string content inside payee
+        let parent = node.parent()?;
+        if parent.kind() == "payee" {
+            let transaction = find_parent_transaction(&parent)?;
+            (parent, transaction)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // Extract payee text
+    let payee_text_raw = text_for_tree_sitter_node(content, &payee_node);
+    let payee_text = payee_text_raw.trim().trim_matches('"').to_string();
+
+    // Check if source_payee already exists
+    if has_source_payee_metadata(&transaction_node, content) {
+        tracing::debug!("Transaction already has source_payee metadata");
+        return None;
+    }
+
+    // Make the node 'static by leaking the tree
+    // This is safe because we only use it within this function scope
+    let payee_node_static = unsafe { std::mem::transmute(payee_node) };
+    let transaction_node_static = unsafe { std::mem::transmute(transaction_node) };
+
+    Some(PayeeInfo {
+        payee_node: payee_node_static,
+        transaction_node: transaction_node_static,
+        payee_text,
+    })
+}
+
+/// Find the parent transaction node
+fn find_parent_transaction<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "transaction" {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Find the last line of the transaction header (after payee and narration)
+fn find_transaction_header_end_line(transaction_node: &tree_sitter::Node) -> usize {
+    let mut last_line = transaction_node.start_position().row;
+    let mut cursor = transaction_node.walk();
+
+    for child in transaction_node.children(&mut cursor) {
+        // Look for payee and narration nodes - they're part of the header
+        if child.kind() == "payee" || child.kind() == "narration" {
+            let end_line = child.end_position().row;
+            if end_line > last_line {
+                last_line = end_line;
+            }
+        }
+    }
+
+    last_line
+}
+
+/// Check if the transaction already has source_desc metadata
+fn has_source_desc_metadata(transaction_node: &tree_sitter::Node, content: &ropey::Rope) -> bool {
+    has_metadata_key(transaction_node, content, "source_desc")
+}
+
+/// Check if the transaction already has source_payee metadata
+fn has_source_payee_metadata(transaction_node: &tree_sitter::Node, content: &ropey::Rope) -> bool {
+    has_metadata_key(transaction_node, content, "source_payee")
+}
+
+/// Check if the transaction has a specific metadata key
+fn has_metadata_key(
+    transaction_node: &tree_sitter::Node,
+    content: &ropey::Rope,
+    key_name: &str,
+) -> bool {
+    let mut cursor = transaction_node.walk();
+    for child in transaction_node.children(&mut cursor) {
+        if child.kind() == "key_value" {
+            // Check if the key matches
+            let mut kv_cursor = child.walk();
+            for kv_child in child.children(&mut kv_cursor) {
+                if kv_child.kind() == "key" {
+                    let key_text = text_for_tree_sitter_node(content, &kv_child);
+                    if key_text == key_name {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build the code action to move narration to metadata
+fn build_move_to_metadata_action(
+    content: &ropey::Rope,
+    narration_info: &NarrationInfo,
+    uri: &lsp_types::Uri,
+) -> Option<lsp_types::CodeAction> {
+    // Build the two text edits needed
+    let mut edits = Vec::new();
+
+    // Edit 1: Replace narration with empty string
+    // Use tree_sitter_node_to_lsp_range to correctly convert byte positions to UTF-16 code units
+    let narration_range = tree_sitter_node_to_lsp_range(content, &narration_info.narration_node);
+
+    edits.push(lsp_types::TextEdit {
+        range: narration_range,
+        new_text: "\"\"".to_string(),
+    });
+
+    // Edit 2: Insert metadata line after transaction line
+    // For multiline narrations, we need to insert after the narration ends
+    let narration_end_line = narration_info.narration_node.end_position().row;
+    let narration_end_line_content = content.line(narration_end_line);
+    // Use len_utf16_cu for correct UTF-16 code unit count (required by LSP)
+    let line_end_char = narration_end_line_content.len_utf16_cu();
+
+    // Detect indentation from first posting or use default
+    let indent = detect_indentation(&narration_info.transaction_node, content);
+
+    // Escape any quotes in the narration text
+    // Preserve newlines - beancount supports multiline strings
+    let escaped_text = narration_info.narration_text.replace('"', "\\\"");
+
+    let insertion_point = lsp_types::Position {
+        line: narration_end_line as u32,
+        character: line_end_char as u32,
+    };
+
+    edits.push(lsp_types::TextEdit {
+        range: lsp_types::Range {
+            start: insertion_point,
+            end: insertion_point,
+        },
+        new_text: format!("\n{}source_desc: \"{}\"", indent, escaped_text),
+    });
+
+    // Sort edits from back to front to preserve positions
+    edits.sort_by_key(|edit| edit.range.start);
+    edits.reverse();
+
+    // Create the workspace edit
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(lsp_types::CodeAction {
+        title: "Move narration to source_desc".to_string(),
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: Some(lsp_types::WorkspaceEdit::new(changes)),
+        command: None,
+        is_preferred: Some(true),
+        disabled: None,
+        data: None,
+    })
+}
+
+/// Build the code action to move payee to metadata
+fn build_move_payee_to_metadata_action(
+    content: &ropey::Rope,
+    payee_info: &PayeeInfo,
+    uri: &lsp_types::Uri,
+) -> Option<lsp_types::CodeAction> {
+    // Build the two text edits needed
+    let mut edits = Vec::new();
+
+    // Edit 1: Replace payee with empty string
+    // Use tree_sitter_node_to_lsp_range to correctly convert byte positions to UTF-16 code units
+    let payee_range = tree_sitter_node_to_lsp_range(content, &payee_info.payee_node);
+
+    edits.push(lsp_types::TextEdit {
+        range: payee_range,
+        new_text: "\"\"".to_string(),
+    });
+
+    // Edit 2: Insert metadata line after transaction header ends
+    // Need to find where the narration ends (if it exists) since it may be multiline
+    let insertion_line = find_transaction_header_end_line(&payee_info.transaction_node);
+    let insertion_line_content = content.line(insertion_line);
+    // Use len_utf16_cu for correct UTF-16 code unit count (required by LSP)
+    let line_end_char = insertion_line_content.len_utf16_cu();
+
+    // Detect indentation from first posting or use default
+    let indent = detect_indentation(&payee_info.transaction_node, content);
+
+    // Escape any quotes in the payee text
+    let escaped_text = payee_info.payee_text.replace('"', "\\\"");
+
+    let insertion_point = lsp_types::Position {
+        line: insertion_line as u32,
+        character: line_end_char as u32,
+    };
+
+    edits.push(lsp_types::TextEdit {
+        range: lsp_types::Range {
+            start: insertion_point,
+            end: insertion_point,
+        },
+        new_text: format!("\n{}source_payee: \"{}\"", indent, escaped_text),
+    });
+
+    // Sort edits from back to front to preserve positions
+    edits.sort_by_key(|edit| edit.range.start);
+    edits.reverse();
+
+    // Create the workspace edit
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(lsp_types::CodeAction {
+        title: "Move payee to source_payee".to_string(),
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: Some(lsp_types::WorkspaceEdit::new(changes)),
+        command: None,
+        is_preferred: Some(false),
+        disabled: None,
+        data: None,
+    })
+}
+
+/// Detect indentation for metadata from existing postings or use default
+fn detect_indentation(transaction_node: &tree_sitter::Node, content: &ropey::Rope) -> String {
+    let mut cursor = transaction_node.walk();
+
+    // Look for first posting child
+    for child in transaction_node.children(&mut cursor) {
+        if child.kind() == "posting" {
+            let posting_line = child.start_position().row;
+            let line_content = content.line(posting_line);
+
+            // Count leading whitespace
+            let indent_count = line_content
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .count();
+
+            return " ".repeat(indent_count);
+        }
+    }
+
+    // Default to 2 spaces if no posting found
+    "  ".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn setup_test(content: &str) -> (tree_sitter::Tree, ropey::Rope) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let rope = ropey::Rope::from_str(content);
+        let tree = parser.parse(content, None).unwrap();
+        (tree, rope)
+    }
+
+    #[test]
+    fn test_find_narration_with_payee() {
+        let content = r#"2022-07-21 * "REWE Essen Limbeck" "Kartenzahlung girocard"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on narration (second string)
+        let position = lsp_types::Position {
+            line: 0,
+            character: 42, // Inside "Kartenzahlung"
+        };
+
+        let result = find_narration_at_cursor(&tree, &rope, position);
+        assert!(result.is_some());
+
+        let info = result.unwrap();
+        assert_eq!(info.narration_text, "Kartenzahlung girocard");
+    }
+
+    #[test]
+    fn test_find_narration_without_payee() {
+        let content = r#"2022-07-21 * "Kartenzahlung girocard"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on narration (only string)
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20,
+        };
+
+        let result = find_narration_at_cursor(&tree, &rope, position);
+        assert!(result.is_some());
+
+        let info = result.unwrap();
+        assert_eq!(info.narration_text, "Kartenzahlung girocard");
+    }
+
+    #[test]
+    fn test_cursor_not_on_narration() {
+        let content = r#"2022-07-21 * "REWE" "Test"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on date
+        let position = lsp_types::Position {
+            line: 0,
+            character: 5,
+        };
+
+        let result = find_narration_at_cursor(&tree, &rope, position);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_empty_narration() {
+        let content = r#"2022-07-21 * "REWE" ""
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 21, // On the empty narration ""
+        };
+
+        let result = find_narration_at_cursor(&tree, &rope, position);
+        assert!(result.is_some()); // Should offer code action even for empty narration
+        assert_eq!(result.unwrap().narration_text, "");
+    }
+
+    #[test]
+    fn test_has_source_desc_metadata() {
+        let content = r#"2022-07-21 * "REWE" "Test"
+  source_desc: "Already exists"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        assert!(has_source_desc_metadata(&transaction, &rope));
+    }
+
+    #[test]
+    fn test_detect_indentation_two_spaces() {
+        let content = r#"2022-07-21 * "Test" "Test"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        let indent = detect_indentation(&transaction, &rope);
+        assert_eq!(indent, "  ");
+    }
+
+    #[test]
+    fn test_detect_indentation_four_spaces() {
+        let content = r#"2022-07-21 * "Test" "Test"
+    Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        let indent = detect_indentation(&transaction, &rope);
+        assert_eq!(indent, "    ");
+    }
+
+    #[test]
+    fn test_detect_indentation_no_posting() {
+        let content = r#"2022-07-21 * "Test" "Test"
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        let indent = detect_indentation(&transaction, &rope);
+        assert_eq!(indent, "  "); // Default to 2 spaces
+    }
+
+    #[test]
+    fn test_multiline_narration() {
+        // Test that multiline narrations are detected correctly
+        let content = "2022-07-21 * \"REWE\" \"Line 1\nLine 2\nLine 3\"
+  Assets:Checking  -3.98 EUR
+";
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on the multiline narration
+        let position = lsp_types::Position {
+            line: 0,
+            character: 25, // Inside the narration
+        };
+
+        let result = find_narration_at_cursor(&tree, &rope, position);
+        assert!(result.is_some());
+
+        let info = result.unwrap();
+        // The raw narration text should preserve the newlines initially
+        assert_eq!(info.narration_text, "Line 1\nLine 2\nLine 3");
+    }
+
+    #[test]
+    fn test_multiline_narration_metadata() {
+        // Test that multiline narrations preserve newlines in metadata
+        let content = "2022-07-21 * \"Test\" \"Line 1\nLine 2\nLine 3\"
+  Assets:Checking  -3.98 EUR
+";
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 25,
+        };
+
+        let narration_info = find_narration_at_cursor(&tree, &rope, position).unwrap();
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+
+        let action = build_move_to_metadata_action(&rope, &narration_info, &uri);
+        assert!(action.is_some());
+
+        let action = action.unwrap();
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Should have exactly 2 edits
+        assert_eq!(edits.len(), 2);
+
+        // Find the metadata insertion edit (the one that's an insertion, not a replacement)
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+
+        // Newlines should be preserved - beancount supports multiline strings
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_desc: \"Line 1\nLine 2\nLine 3\""
+        );
+
+        // Find the narration replacement edit
+        let narration_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+        assert_eq!(narration_edit.new_text, "\"\"");
+    }
+
+    #[test]
+    fn test_multiline_narration_insertion_point() {
+        // Test that insertion point is after narration ends, not after first line
+        let content = r#"2021-09-16 * "PayPal" "Basislastschrift
+PP.8571.PP"
+  Assets:Checking  -6.49 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        println!("Content:\n{}", content);
+        println!("Tree:\n{}", tree.root_node().to_sexp());
+
+        // Cursor on the narration (on first line)
+        let position = lsp_types::Position {
+            line: 0,
+            character: 30, // Inside "Basislastschrift"
+        };
+
+        let narration_info = find_narration_at_cursor(&tree, &rope, position).unwrap();
+        println!("Narration text: {:?}", narration_info.narration_text);
+        println!(
+            "Narration node start: {:?}",
+            narration_info.narration_node.start_position()
+        );
+        println!(
+            "Narration node end: {:?}",
+            narration_info.narration_node.end_position()
+        );
+
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+        let action = build_move_to_metadata_action(&rope, &narration_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Debug all edits
+        for (i, edit) in edits.iter().enumerate() {
+            println!(
+                "Edit {}: range={:?}, text={:?}",
+                i, edit.range, edit.new_text
+            );
+        }
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+        println!("Metadata edit text: {:?}", metadata_edit.new_text);
+
+        // Find the narration replacement edit
+        let narration_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+        println!("Narration edit range: {:?}", narration_edit.range);
+        println!("Narration edit text: {:?}", narration_edit.new_text);
+
+        // Metadata should preserve the multiline narration
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_desc: \"Basislastschrift\nPP.8571.PP\""
+        );
+
+        // Check narration replacement range - should span from line 0 col 22 to line 1 col 11
+        assert_eq!(narration_edit.range.start.line, 0);
+        assert_eq!(narration_edit.range.start.character, 22);
+        assert_eq!(narration_edit.range.end.line, 1);
+        assert_eq!(narration_edit.range.end.character, 11);
+        assert_eq!(narration_edit.new_text, "\"\"");
+
+        // Check metadata insertion point - should be AFTER the narration ends (line 1, after col 11)
+        assert_eq!(metadata_edit.range.start.line, 1);
+        // The line length includes the closing quote and newline
+        assert!(metadata_edit.range.start.character >= 11);
+    }
+
+    #[test]
+    fn test_find_payee() {
+        let content = r#"2022-07-21 * "REWE Essen Limbeck" "Kartenzahlung"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on payee
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20, // Inside "REWE Essen Limbeck"
+        };
+
+        let result = find_payee_at_cursor(&tree, &rope, position);
+        assert!(result.is_some());
+
+        let info = result.unwrap();
+        assert_eq!(info.payee_text, "REWE Essen Limbeck");
+    }
+
+    #[test]
+    fn test_move_payee_to_metadata() {
+        let content = r#"2022-07-21 * "REWE Essen Limbeck" "Groceries"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20,
+        };
+
+        let payee_info = find_payee_at_cursor(&tree, &rope, position).unwrap();
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+
+        let action = build_move_payee_to_metadata_action(&rope, &payee_info, &uri);
+        assert!(action.is_some());
+
+        let action = action.unwrap();
+        assert_eq!(action.title, "Move payee to source_payee");
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        assert_eq!(edits.len(), 2);
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_payee: \"REWE Essen Limbeck\""
+        );
+
+        // Find the payee replacement edit
+        let payee_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+        assert_eq!(payee_edit.new_text, "\"\"");
+    }
+
+    #[test]
+    fn test_payee_not_found_on_narration() {
+        let content = r#"2022-07-21 * "REWE" "Kartenzahlung"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on narration, not payee
+        let position = lsp_types::Position {
+            line: 0,
+            character: 30,
+        };
+
+        let result = find_payee_at_cursor(&tree, &rope, position);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_has_source_payee_metadata() {
+        let content = r#"2022-07-21 * "REWE" "Test"
+  source_payee: "Already exists"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        assert!(has_source_payee_metadata(&transaction, &rope));
+    }
+
+    #[test]
+    fn test_multiline_narration_long_line() {
+        // Test case: multiline narration with long second line
+        // This reproduces a bug where the metadata was truncated
+        let content = r#"2022-10-12 * "notebooksbilliger..de AG" "Überweisungsauftrag
+Auftrag TIDVKS18668190 Jakob Hellermann TAN: SecureGo plus IBAN: DE22259501300039999991 BIC: NOLADE21HIK"
+  Assets:BIBEssen:Checking                      -252.99 EUR
+  Expenses:Household:Electronics                 252.99 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on the narration
+        let position = lsp_types::Position {
+            line: 0,
+            character: 50, // Inside the narration "Überweisungsauftrag"
+        };
+
+        let narration_info = find_narration_at_cursor(&tree, &rope, position).unwrap();
+
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+        let action = build_move_to_metadata_action(&rope, &narration_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+
+        let expected_narration = "Überweisungsauftrag\nAuftrag TIDVKS18668190 Jakob Hellermann TAN: SecureGo plus IBAN: DE22259501300039999991 BIC: NOLADE21HIK";
+
+        // The full narration should be preserved
+        assert_eq!(
+            metadata_edit.new_text,
+            format!("\n  source_desc: \"{}\"", expected_narration)
+        );
+
+        // Check that the narration replacement uses correct UTF-16 positions
+        let narration_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+        // The narration starts at character 40 (after "2022-10-12 * \"notebooksbilliger..de AG\" ")
+        assert_eq!(narration_edit.range.start.line, 0);
+        assert_eq!(narration_edit.range.start.character, 40);
+    }
+
+    #[test]
+    fn test_narration_with_multibyte_chars_uses_utf16_positions() {
+        // Test that both input and output positions correctly use UTF-16 code units
+        // The issue was that tree-sitter byte offsets were used directly, causing
+        // incorrect ranges when there are multibyte UTF-8 characters
+        let content = r#"2022-10-12 * "日本語ペイ" "支払い説明"
+  Assets:Checking  -100 JPY
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // UTF-16 positions:
+        // "2022-10-12 * " = 13 chars
+        // "\"日本語ペイ\" " = 8 chars (1 + 5 + 1 + 1)
+        // = 21 for the opening quote of narration
+        // Position 22 is inside the narration
+        let position = lsp_types::Position {
+            line: 0,
+            character: 22, // Inside "支払い説明" (UTF-16 position)
+        };
+
+        let narration_info = find_narration_at_cursor(&tree, &rope, position).unwrap();
+        assert_eq!(narration_info.narration_text, "支払い説明");
+
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+        let action = build_move_to_metadata_action(&rope, &narration_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Find the narration replacement edit
+        let narration_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+
+        // The narration starts at character 21 in UTF-16:
+        // "2022-10-12 * " = 13 chars
+        // "\"日本語ペイ\" " = 8 chars (1 + 5 + 1 + 1)
+        // = 21 for the opening quote of narration
+        assert_eq!(narration_edit.range.start.line, 0);
+        assert_eq!(narration_edit.range.start.character, 21);
+
+        // End position in UTF-16: 21 + 1 (") + 5 (Japanese chars) + 1 (") = 28
+        assert_eq!(narration_edit.range.end.line, 0);
+        assert_eq!(narration_edit.range.end.character, 28);
+    }
+
+    #[test]
+    fn test_move_payee_with_multibyte_chars_uses_utf16_positions() {
+        // Test that payee positions are correctly converted to UTF-16 code units
+        let content = r#"2022-10-12 * "日本語ペイ" "支払い説明"
+  Assets:Checking  -100 JPY
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on the payee (UTF-16 position)
+        // "2022-10-12 * " = 13 chars, so position 14 is inside the payee
+        let position = lsp_types::Position {
+            line: 0,
+            character: 14, // Inside "日本語ペイ"
+        };
+
+        let payee_info = find_payee_at_cursor(&tree, &rope, position).unwrap();
+        assert_eq!(payee_info.payee_text, "日本語ペイ");
+
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+        let action = build_move_payee_to_metadata_action(&rope, &payee_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Find the payee replacement edit
+        let payee_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+
+        // The payee starts at character 13 in UTF-16:
+        // "2022-10-12 * " = 13 chars
+        assert_eq!(payee_edit.range.start.line, 0);
+        assert_eq!(payee_edit.range.start.character, 13);
+
+        // End position: 13 + 1 (") + 5 (Japanese chars) + 1 (") = 20
+        assert_eq!(payee_edit.range.end.line, 0);
+        assert_eq!(payee_edit.range.end.character, 20);
+    }
+
+    #[test]
+    fn test_move_payee_with_multiline_narration() {
+        // Test that moving payee works correctly when narration is multiline
+        let content = r#"2021-09-22 * "Lastschrift aus Kartenzahlung" "Kartenzahlung girocard
+BAECKER PETER"
+  Assets:Checking  -4.45 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20, // On payee
+        };
+
+        let payee_info = find_payee_at_cursor(&tree, &rope, position).unwrap();
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+
+        let action = build_move_payee_to_metadata_action(&rope, &payee_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+
+        // Metadata should be inserted AFTER the multiline narration ends (line 1)
+        assert_eq!(metadata_edit.range.start.line, 1);
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_payee: \"Lastschrift aus Kartenzahlung\""
+        );
+    }
+}

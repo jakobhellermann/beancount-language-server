@@ -545,7 +545,9 @@ impl LspServerState {
             .on::<lsp_types::request::WorkspaceSymbolRequest>(
                 handlers::text_document::workspace_symbol,
             )
-            .expect("Failed to register WorkspaceSymbol handler");
+            .expect("Failed to register WorkspaceSymbol handler")
+            .on::<lsp_types::request::CodeActionRequest>(handlers::text_document::code_actions)
+            .expect("Failed to register CodeAction handler");
 
         router
     }
