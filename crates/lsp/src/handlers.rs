@@ -14,6 +14,7 @@ pub mod workspace {
 }
 
 pub mod text_document {
+    use crate::providers::code_actions;
     use crate::providers::completion;
     use crate::providers::definition;
     use crate::providers::document_symbol;
@@ -372,6 +373,32 @@ pub mod text_document {
             }
             Err(e) => {
                 tracing::error!("Workspace symbols failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn code_actions(
+        snapshot: LspServerStateSnapshot,
+        params: lsp_types::CodeActionParams,
+    ) -> Result<Option<Vec<lsp_types::CodeActionOrCommand>>> {
+        tracing::debug!(
+            "Code actions requested for: {} at range {:?}",
+            params.text_document.uri.as_str(),
+            params.range
+        );
+
+        match code_actions::code_actions(snapshot, params) {
+            Ok(Some(actions)) => {
+                tracing::trace!("Returning {} code actions", actions.len());
+                Ok(Some(actions))
+            }
+            Ok(None) => {
+                tracing::debug!("No code actions available");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::error!("Code actions failed: {}", e);
                 Err(e)
             }
         }
