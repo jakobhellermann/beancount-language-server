@@ -35,20 +35,31 @@ pub(crate) fn code_actions(
         }
     };
 
-    // Try to find narration at cursor and build the code action
-    match find_narration_at_cursor(tree, content, params.range.start) {
-        Some(narration_info) => {
-            if let Some(action) =
-                build_move_to_metadata_action(content, &narration_info, &params.text_document.uri)
-            {
-                Ok(Some(vec![lsp_types::CodeActionOrCommand::CodeAction(
-                    action,
-                )]))
-            } else {
-                Ok(None)
-            }
+    // Collect all available code actions
+    let mut actions = Vec::new();
+
+    // Check for narration at cursor
+    if let Some(narration_info) = find_narration_at_cursor(tree, content, params.range.start) {
+        if let Some(action) =
+            build_move_to_metadata_action(content, &narration_info, &params.text_document.uri)
+        {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(action));
         }
-        None => Ok(None),
+    }
+
+    // Check for payee at cursor
+    if let Some(payee_info) = find_payee_at_cursor(tree, content, params.range.start) {
+        if let Some(action) =
+            build_move_payee_to_metadata_action(content, &payee_info, &params.text_document.uri)
+        {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(action));
+        }
+    }
+
+    if actions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(actions))
     }
 }
 
@@ -60,6 +71,16 @@ struct NarrationInfo {
     transaction_node: tree_sitter::Node<'static>,
     /// The narration text (without quotes)
     narration_text: String,
+}
+
+#[derive(Debug)]
+struct PayeeInfo {
+    /// The tree-sitter node for the payee
+    payee_node: tree_sitter::Node<'static>,
+    /// The parent transaction node
+    transaction_node: tree_sitter::Node<'static>,
+    /// The payee text (without quotes)
+    payee_text: String,
 }
 
 /// Find narration node at the given cursor position
@@ -123,6 +144,67 @@ fn find_narration_at_cursor(
     })
 }
 
+/// Find payee node at the given cursor position
+fn find_payee_at_cursor(
+    tree: &tree_sitter::Tree,
+    content: &ropey::Rope,
+    cursor_position: lsp_types::Position,
+) -> Option<PayeeInfo> {
+    // Convert LSP position to tree-sitter Point
+    let ts_point = tree_sitter::Point {
+        row: cursor_position.line as usize,
+        column: cursor_position.character as usize,
+    };
+
+    // Find the node at the cursor position
+    let root = tree.root_node();
+    let node = root.named_descendant_for_point_range(ts_point, ts_point)?;
+
+    // Check if we're on a payee node
+    let (payee_node, transaction_node) = if node.kind() == "payee" {
+        // Direct hit on payee
+        let transaction = find_parent_transaction(&node)?;
+        (node, transaction)
+    } else if node.kind() == "string" {
+        // We might be on the string content inside payee
+        let parent = node.parent()?;
+        if parent.kind() == "payee" {
+            let transaction = find_parent_transaction(&parent)?;
+            (parent, transaction)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // Extract payee text
+    let payee_text_raw = text_for_tree_sitter_node(content, &payee_node);
+    let payee_text = payee_text_raw.trim().trim_matches('"').to_string();
+
+    // Skip if payee is empty or whitespace-only
+    if payee_text.trim().is_empty() {
+        return None;
+    }
+
+    // Check if source_payee already exists
+    if has_source_payee_metadata(&transaction_node, content) {
+        tracing::debug!("Transaction already has source_payee metadata");
+        return None;
+    }
+
+    // Make the node 'static by leaking the tree
+    // This is safe because we only use it within this function scope
+    let payee_node_static = unsafe { std::mem::transmute(payee_node) };
+    let transaction_node_static = unsafe { std::mem::transmute(transaction_node) };
+
+    Some(PayeeInfo {
+        payee_node: payee_node_static,
+        transaction_node: transaction_node_static,
+        payee_text,
+    })
+}
+
 /// Find the parent transaction node
 fn find_parent_transaction<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
     let mut current = *node;
@@ -135,17 +217,49 @@ fn find_parent_transaction<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitt
     None
 }
 
+/// Find the last line of the transaction header (after payee and narration)
+fn find_transaction_header_end_line(transaction_node: &tree_sitter::Node) -> usize {
+    let mut last_line = transaction_node.start_position().row;
+    let mut cursor = transaction_node.walk();
+
+    for child in transaction_node.children(&mut cursor) {
+        // Look for payee and narration nodes - they're part of the header
+        if child.kind() == "payee" || child.kind() == "narration" {
+            let end_line = child.end_position().row;
+            if end_line > last_line {
+                last_line = end_line;
+            }
+        }
+    }
+
+    last_line
+}
+
 /// Check if the transaction already has source_desc metadata
 fn has_source_desc_metadata(transaction_node: &tree_sitter::Node, content: &ropey::Rope) -> bool {
+    has_metadata_key(transaction_node, content, "source_desc")
+}
+
+/// Check if the transaction already has source_payee metadata
+fn has_source_payee_metadata(transaction_node: &tree_sitter::Node, content: &ropey::Rope) -> bool {
+    has_metadata_key(transaction_node, content, "source_payee")
+}
+
+/// Check if the transaction has a specific metadata key
+fn has_metadata_key(
+    transaction_node: &tree_sitter::Node,
+    content: &ropey::Rope,
+    key_name: &str,
+) -> bool {
     let mut cursor = transaction_node.walk();
     for child in transaction_node.children(&mut cursor) {
         if child.kind() == "key_value" {
-            // Check if the key is "source_desc"
+            // Check if the key matches
             let mut kv_cursor = child.walk();
             for kv_child in child.children(&mut kv_cursor) {
                 if kv_child.kind() == "key" {
                     let key_text = text_for_tree_sitter_node(content, &kv_child);
-                    if key_text == "source_desc" {
+                    if key_text == key_name {
                         return true;
                     }
                 }
@@ -225,6 +339,80 @@ fn build_move_to_metadata_action(
         edit: Some(lsp_types::WorkspaceEdit::new(changes)),
         command: None,
         is_preferred: Some(true),
+        disabled: None,
+        data: None,
+    })
+}
+
+/// Build the code action to move payee to metadata
+fn build_move_payee_to_metadata_action(
+    content: &ropey::Rope,
+    payee_info: &PayeeInfo,
+    uri: &lsp_types::Uri,
+) -> Option<lsp_types::CodeAction> {
+    // Build the two text edits needed
+    let mut edits = Vec::new();
+
+    // Edit 1: Replace payee with empty string
+    let payee_start = payee_info.payee_node.start_position();
+    let payee_end = payee_info.payee_node.end_position();
+
+    let payee_range = lsp_types::Range {
+        start: lsp_types::Position {
+            line: payee_start.row as u32,
+            character: payee_start.column as u32,
+        },
+        end: lsp_types::Position {
+            line: payee_end.row as u32,
+            character: payee_end.column as u32,
+        },
+    };
+
+    edits.push(lsp_types::TextEdit {
+        range: payee_range,
+        new_text: "\"\"".to_string(),
+    });
+
+    // Edit 2: Insert metadata line after transaction header ends
+    // Need to find where the narration ends (if it exists) since it may be multiline
+    let insertion_line = find_transaction_header_end_line(&payee_info.transaction_node);
+    let insertion_line_content = content.line(insertion_line);
+    let line_end_char = insertion_line_content.len_chars();
+
+    // Detect indentation from first posting or use default
+    let indent = detect_indentation(&payee_info.transaction_node, content);
+
+    // Escape any quotes in the payee text
+    let escaped_text = payee_info.payee_text.replace('"', "\\\"");
+
+    let insertion_point = lsp_types::Position {
+        line: insertion_line as u32,
+        character: line_end_char as u32,
+    };
+
+    edits.push(lsp_types::TextEdit {
+        range: lsp_types::Range {
+            start: insertion_point,
+            end: insertion_point,
+        },
+        new_text: format!("\n{}source_payee: \"{}\"", indent, escaped_text),
+    });
+
+    // Sort edits from back to front to preserve positions
+    edits.sort_by_key(|edit| edit.range.start);
+    edits.reverse();
+
+    // Create the workspace edit
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+
+    Some(lsp_types::CodeAction {
+        title: "Move payee to source_payee".to_string(),
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        diagnostics: None,
+        edit: Some(lsp_types::WorkspaceEdit::new(changes)),
+        command: None,
+        is_preferred: Some(false),
         disabled: None,
         data: None,
     })
@@ -554,5 +742,135 @@ PP.8571.PP"
         assert_eq!(metadata_edit.range.start.line, 1);
         // The line length includes the closing quote and newline
         assert!(metadata_edit.range.start.character >= 11);
+    }
+
+    #[test]
+    fn test_find_payee() {
+        let content = r#"2022-07-21 * "REWE Essen Limbeck" "Kartenzahlung"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on payee
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20, // Inside "REWE Essen Limbeck"
+        };
+
+        let result = find_payee_at_cursor(&tree, &rope, position);
+        assert!(result.is_some());
+
+        let info = result.unwrap();
+        assert_eq!(info.payee_text, "REWE Essen Limbeck");
+    }
+
+    #[test]
+    fn test_move_payee_to_metadata() {
+        let content = r#"2022-07-21 * "REWE Essen Limbeck" "Groceries"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20,
+        };
+
+        let payee_info = find_payee_at_cursor(&tree, &rope, position).unwrap();
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+
+        let action = build_move_payee_to_metadata_action(&rope, &payee_info, &uri);
+        assert!(action.is_some());
+
+        let action = action.unwrap();
+        assert_eq!(action.title, "Move payee to source_payee");
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        assert_eq!(edits.len(), 2);
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_payee: \"REWE Essen Limbeck\""
+        );
+
+        // Find the payee replacement edit
+        let payee_edit = edits.iter().find(|e| e.range.start != e.range.end).unwrap();
+        assert_eq!(payee_edit.new_text, "\"\"");
+    }
+
+    #[test]
+    fn test_payee_not_found_on_narration() {
+        let content = r#"2022-07-21 * "REWE" "Kartenzahlung"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        // Cursor on narration, not payee
+        let position = lsp_types::Position {
+            line: 0,
+            character: 30,
+        };
+
+        let result = find_payee_at_cursor(&tree, &rope, position);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_has_source_payee_metadata() {
+        let content = r#"2022-07-21 * "REWE" "Test"
+  source_payee: "Already exists"
+  Assets:Checking  -3.98 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let root = tree.root_node();
+        let transaction = root
+            .named_descendant_for_point_range(
+                tree_sitter::Point::new(0, 0),
+                tree_sitter::Point::new(0, 0),
+            )
+            .and_then(|node| find_parent_transaction(&node))
+            .unwrap();
+
+        assert!(has_source_payee_metadata(&transaction, &rope));
+    }
+
+    #[test]
+    fn test_move_payee_with_multiline_narration() {
+        // Test that moving payee works correctly when narration is multiline
+        let content = r#"2021-09-22 * "Lastschrift aus Kartenzahlung" "Kartenzahlung girocard
+BAECKER PETER"
+  Assets:Checking  -4.45 EUR
+"#;
+        let (tree, rope) = setup_test(content);
+
+        let position = lsp_types::Position {
+            line: 0,
+            character: 20, // On payee
+        };
+
+        let payee_info = find_payee_at_cursor(&tree, &rope, position).unwrap();
+        let uri = lsp_types::Uri::from_str("file:///tmp/test.beancount").unwrap();
+
+        let action = build_move_payee_to_metadata_action(&rope, &payee_info, &uri).unwrap();
+
+        let edit = action.edit.unwrap();
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // Find the metadata insertion edit
+        let metadata_edit = edits.iter().find(|e| e.range.start == e.range.end).unwrap();
+
+        // Metadata should be inserted AFTER the multiline narration ends (line 1)
+        assert_eq!(metadata_edit.range.start.line, 1);
+        assert_eq!(
+            metadata_edit.new_text,
+            "\n  source_payee: \"Lastschrift aus Kartenzahlung\""
+        );
     }
 }
