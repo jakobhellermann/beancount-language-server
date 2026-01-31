@@ -1,4 +1,5 @@
 use crate::providers::semantic_tokens;
+use lsp_types::CodeActionProviderCapability;
 use lsp_types::FoldingRangeProviderCapability;
 use lsp_types::InlayHintOptions;
 use lsp_types::InlayHintServerCapabilities;
@@ -66,6 +67,7 @@ pub(crate) fn server_capabilities() -> ServerCapabilities {
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     }
 }
@@ -330,9 +332,9 @@ mod tests {
             caps.workspace_symbol_provider.is_some(),
             "workspace_symbol is implemented"
         );
-        assert_eq!(
-            caps.code_action_provider, None,
-            "code_action is not implemented"
+        assert!(
+            caps.code_action_provider.is_some(),
+            "code_action is implemented"
         );
         assert_eq!(
             caps.code_lens_provider, None,
@@ -493,6 +495,16 @@ mod tests {
             )
                 -> anyhow::Result<Option<lsp_types::WorkspaceSymbolResponse>> =
                 handlers::text_document::workspace_symbol;
+        }
+
+        // Code action capability -> handlers::text_document::code_actions
+        if caps.code_action_provider.is_some() {
+            let _handler: fn(
+                LspServerStateSnapshot,
+                lsp_types::CodeActionParams,
+            )
+                -> anyhow::Result<Option<Vec<lsp_types::CodeActionOrCommand>>> =
+                handlers::text_document::code_actions;
         }
 
         // Text document sync notifications (these don't return responses)
